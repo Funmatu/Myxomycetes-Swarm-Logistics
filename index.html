@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Project MYXOMYCETES: Advanced Swarm Simulator</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.7/dat.gui.min.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; color: #0f0; font-family: 'Courier New', Courier, monospace; }
+        #ui-layer { position: absolute; top: 10px; left: 10px; z-index: 100; pointer-events: none; }
+        .stat-panel { background: rgba(0, 20, 0, 0.8); border: 1px solid #0f0; padding: 10px; margin-bottom: 5px; pointer-events: auto; }
+        canvas { display: block; }
+        #overlay { position: absolute; bottom: 20px; left: 20px; color: #0f0; font-size: 12px; pointer-events: none; }
+        .legend { margin-top: 10px; font-size: 11px; }
+        .legend-item { display: flex; align-items: center; margin-bottom: 3px; }
+        .dot { width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
+    </style>
+</head>
+<body>
+
+<div id="ui-layer">
+    <div class="stat-panel">
+        <h2 style="margin:0 0 10px 0; font-size:16px;">PROJECT MYXOMYCETES v2.0</h2>
+        <div>STATUS: <span id="status">SWARM ACTIVE</span></div>
+        <div>THROUGHPUT: <span id="throughput">0</span> pkgs/min</div>
+        <div>ACTIVE AGVs: <span id="agv-count-display">0</span></div>
+        
+        <div class="legend">
+            <div class="legend-item"><div class="dot" style="background: #f00;"></div>Pickup (Red)</div>
+            <div class="legend-item"><div class="dot" style="background: #0f0;"></div>Delivery (Green)</div>
+            <div class="legend-item"><div class="dot" style="background: #00f;"></div>Repulsion/Wall (Blue)</div>
+            <div class="legend-item"><div class="dot" style="background: #ff0;"></div>Reinforced Vein (Yellow)</div>
+        </div>
+    </div>
+    <div class="stat-panel">
+        <div style="font-size:12px;">SYSTEM LOG:</div>
+        <div id="log" style="font-size:10px; height: 80px; overflow-y: hidden;"></div>
+    </div>
+</div>
+
+<div id="overlay">
+    [CORE] Decentralized Emergent Optimization Engine<br>
+    [SYS] Adaptive Grid Topology: 128x128<br>
+    [DATA] Real-time Manifold Projection Active
+</div>
+
+<script>
+/**
+ * Project MYXOMYCETES v2.0
+ * 真正粘菌のアルゴリズムに基づいた、自己組織化物流シミュレーター。
+ * * 1. 空間ポテンシャルによるナビゲーション
+ * 2. 成功経路の環境側への記憶（Vein Reinforcement）
+ * 3. 局所的な相互作用による大域的な交通整理（渋滞回避）
+ */
+
+const GRID_SIZE = 128;
+
+class PhysarumField {
+    constructor(w, h) {
+        this.width = w;
+        this.height = h;
+        this.size = w * h;
+        
+        this.pickup = new Float32Array(this.size);    
+        this.delivery = new Float32Array(this.size);  
+        this.repulsion = new Float32Array(this.size); 
+        this.vein = new Float32Array(this.size);      
+        this.obstacles = new Uint8Array(this.size);   
+        
+        this.nextP = new Float32Array(this.size);
+        this.nextD = new Float32Array(this.size);
+        this.nextR = new Float32Array(this.size);
+
+        this.params = {
+            diff: 0.15,
+            decay: 0.05,
+            veinDecay: 0.003,
+            repulsionDecay: 0.15
+        };
+
+        this.randomizeObstacles();
+    }
+
+    randomizeObstacles() {
+        // 全消去
+        this.obstacles.fill(0);
+        this.vein.fill(0);
+        this.pickup.fill(0);
+        this.delivery.fill(0);
+
+        // 外周の壁
+        for(let i=0; i<this.width; i++) {
+            this.obstacles[i] = 1;
+            this.obstacles[(this.height-1)*this.width + i] = 1;
+            this.obstacles[i*this.width] = 1;
+            this.obstacles[i*this.width + (this.width-1)] = 1;
+        }
+
+        // ランダムな障害物ブロック
+        const blockCount = 12 + Math.random() * 8;
+        for(let n=0; n<blockCount; n++) {
+            const bx = 20 + Math.random() * (this.width - 40);
+            const by = 20 + Math.random() * (this.height - 40);
+            const bw = 5 + Math.random() * 15;
+            const bh = 5 + Math.random() * 15;
+            for(let y=Math.floor(by); y<Math.floor(by+bh); y++) {
+                for(let x=Math.floor(bx); x<Math.floor(bx+bw); x++) {
+                    this.obstacles[y * this.width + x] = 1;
+                }
+            }
+        }
+    }
+
+    update() {
+        // ソース放出（左上：集荷所、右下：配送所）
+        this.pickup[12 * this.width + 12] = 10.0;
+        this.pickup[13 * this.width + 12] = 10.0;
+        this.delivery[(this.height-12) * this.width + (this.width-12)] = 10.0;
+        this.delivery[(this.height-13) * this.width + (this.width-12)] = 10.0;
+
+        for (let y = 1; y < this.height - 1; y++) {
+            for (let x = 1; x < this.width - 1; x++) {
+                const i = y * this.width + x;
+                if (this.obstacles[i]) {
+                    this.repulsion[i] = 1.0; 
+                    continue;
+                }
+
+                // 拡散（5点ラプラシアン）
+                const lapP = (this.pickup[i-1] + this.pickup[i+1] + this.pickup[i-this.width] + this.pickup[i+this.width] - 4 * this.pickup[i]);
+                const lapD = (this.delivery[i-1] + this.delivery[i+1] + this.delivery[i-this.width] + this.delivery[i+this.width] - 4 * this.delivery[i]);
+                const lapR = (this.repulsion[i-1] + this.repulsion[i+1] + this.repulsion[i-this.width] + this.repulsion[i+this.width] - 4 * this.repulsion[i]);
+
+                this.nextP[i] = Math.max(0, (this.pickup[i] + this.params.diff * lapP) * (1.0 - this.params.decay));
+                this.nextD[i] = Math.max(0, (this.delivery[i] + this.params.diff * lapD) * (1.0 - this.params.decay));
+                this.nextR[i] = Math.max(0, (this.repulsion[i] + this.params.diff * lapR) * (1.0 - this.params.repulsionDecay));
+                
+                this.vein[i] *= (1.0 - this.params.veinDecay);
+            }
+        }
+
+        this.pickup.set(this.nextP);
+        this.delivery.set(this.nextD);
+        this.repulsion.set(this.nextR);
+    }
+
+    addRepulsion(x, y, val) {
+        const gx = Math.floor(x);
+        const gy = Math.floor(y);
+        if (gx >= 0 && gx < this.width && gy >= 0 && gy < this.height) {
+            this.repulsion[gy * this.width + gx] += val;
+        }
+    }
+
+    reinforcePath(history) {
+        history.forEach(p => {
+            const gx = Math.floor(p.x);
+            const gy = Math.floor(p.y);
+            if (gx >= 0 && gx < this.width && gy >= 0 && gy < this.height) {
+                this.vein[gy * this.width + gx] += 0.35;
+            }
+        });
+    }
+}
+
+class AGV {
+    constructor(id) {
+        this.id = id;
+        this.reset();
+        this.mesh = null;
+    }
+
+    reset() {
+        this.x = 10 + Math.random() * 20;
+        this.y = 10 + Math.random() * 20;
+        this.angle = Math.random() * Math.PI * 2;
+        this.state = 'SEEK_PICKUP';
+        this.timer = 0;
+        this.history = [];
+        this.speed = 0.4 + Math.random() * 0.15;
+    }
+
+    update(field) {
+        if (this.timer > 0) {
+            this.timer--;
+            field.addRepulsion(this.x, this.y, 0.6);
+            return;
+        }
+
+        const gx = Math.floor(this.x);
+        const gy = Math.floor(this.y);
+        const idx = gy * field.width + gx;
+
+        let targetField = (this.state === 'SEEK_PICKUP') ? field.pickup : field.delivery;
+        
+        // 走化性センサー
+        const sensorDist = 6;
+        const sensorAngle = 0.6;
+        
+        const getVal = (offset) => {
+            const sx = Math.floor(this.x + Math.cos(this.angle + offset) * sensorDist);
+            const sy = Math.floor(this.y + Math.sin(this.angle + offset) * sensorDist);
+            if (sx < 0 || sx >= field.width || sy < 0 || sy >= field.height) return -1;
+            const i = sy * field.width + sx;
+            if (field.obstacles[i]) return -5;
+            // ポテンシャル + 過去の記憶 - 他者への回避
+            return targetField[i] + field.vein[i] * 0.4 - field.repulsion[i] * 3.0;
+        };
+
+        const f = getVal(0);
+        const l = getVal(-sensorAngle);
+        const r = getVal(sensorAngle);
+
+        if (f > l && f > r) { /* Forward */ }
+        else if (f < l && f < r) { this.angle += (Math.random() - 0.5) * 1.5; }
+        else if (l > r) { this.angle -= 0.12; }
+        else if (r > l) { this.angle += 0.12; }
+
+        const nextX = this.x + Math.cos(this.angle) * this.speed;
+        const nextY = this.y + Math.sin(this.angle) * this.speed;
+
+        // 壁との衝突
+        const ni = Math.floor(nextY) * field.width + Math.floor(nextX);
+        if (nextX > 0 && nextX < field.width && nextY > 0 && nextY < field.height && !field.obstacles[ni]) {
+            this.x = nextX;
+            this.y = nextY;
+        } else {
+            this.angle += Math.PI * (0.4 + Math.random() * 0.2);
+        }
+
+        field.addRepulsion(this.x, this.y, 0.4);
+        if (this.state === 'SEEK_DELIVERY') {
+            this.history.push({x: this.x, y: this.y});
+            if (this.history.length > 300) this.history.shift();
+        }
+
+        // FSM 遷移
+        if (this.state === 'SEEK_PICKUP' && field.pickup[idx] > 2.5) {
+            this.state = 'LOADING';
+            this.timer = 50;
+            this.history = [];
+        } else if (this.state === 'LOADING' && this.timer === 0) {
+            this.state = 'SEEK_DELIVERY';
+        } else if (this.state === 'SEEK_DELIVERY' && field.delivery[idx] > 2.5) {
+            this.state = 'UNLOADING';
+            this.timer = 50;
+            field.reinforcePath(this.history);
+            window.dispatchEvent(new CustomEvent('pkg-delivered'));
+        } else if (this.state === 'UNLOADING' && this.timer === 0) {
+            this.state = 'SEEK_PICKUP';
+        }
+    }
+}
+
+// Global Variables
+let scene, camera, renderer, field, agvs = [], fieldMesh;
+let totalDelivered = 0;
+let startTime = Date.now();
+const agvParams = { count: 30 };
+
+function init() {
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(GRID_SIZE/2, -GRID_SIZE/1.1, GRID_SIZE/1.0);
+    camera.lookAt(GRID_SIZE/2, GRID_SIZE/2, 0);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    field = new PhysarumField(GRID_SIZE, GRID_SIZE);
+
+    // フィールドメッシュ
+    const geometry = new THREE.PlaneBufferGeometry(GRID_SIZE, GRID_SIZE, GRID_SIZE-1, GRID_SIZE-1);
+    const material = new THREE.ShaderMaterial({
+        uniforms: {
+            uPickup: { value: null },
+            uDelivery: { value: null },
+            uRepulsion: { value: null },
+            uVein: { value: null },
+            uObstacles: { value: null }
+        },
+        vertexShader: `
+            varying vec2 vUv;
+            varying float vHeight;
+            uniform sampler2D uVein;
+            uniform sampler2D uObstacles;
+            void main() {
+                vUv = uv;
+                float v = texture2D(uVein, uv).r;
+                float obs = texture2D(uObstacles, uv).r;
+                vHeight = v * 8.0 + obs * 4.0; 
+                vec3 pos = position;
+                pos.z += vHeight;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+            }
+        `,
+        fragmentShader: `
+            varying vec2 vUv;
+            uniform sampler2D uPickup;
+            uniform sampler2D uDelivery;
+            uniform sampler2D uRepulsion;
+            uniform sampler2D uVein;
+            uniform sampler2D uObstacles;
+            void main() {
+                float p = texture2D(uPickup, vUv).r;
+                float d = texture2D(uDelivery, vUv).r;
+                float r = texture2D(uRepulsion, vUv).r;
+                float v = texture2D(uVein, vUv).r;
+                float obs = texture2D(uObstacles, vUv).r;
+                
+                vec3 color = vec3(0.0);
+                color.r = p * 1.0 + v * 0.6; 
+                color.g = d * 1.0 + v * 0.6; 
+                color.b = r * 0.6 + obs * 0.4; 
+
+                if(obs > 0.5) color = vec3(0.1, 0.1, 0.3);
+
+                gl_FragColor = vec4(color, 0.95);
+            }
+        `,
+        transparent: true
+    });
+
+    fieldMesh = new THREE.Mesh(geometry, material);
+    fieldMesh.position.set(GRID_SIZE/2, GRID_SIZE/2, 0);
+    scene.add(fieldMesh);
+
+    updateAGVCount(agvParams.count);
+
+    // GUI
+    const gui = new dat.GUI();
+    const fSwarm = gui.addFolder('Swarm Configuration');
+    fSwarm.add(agvParams, 'count', 10, 200).step(1).name('AGV Count').onChange(updateAGVCount);
+    fSwarm.add(field.params, 'diff', 0.01, 0.3).name('Diffusion');
+    fSwarm.add(field.params, 'decay', 0.01, 0.1).name('Decay');
+    fSwarm.open();
+
+    const fEnv = gui.addFolder('Environment Control');
+    fEnv.add({ randomize: () => { 
+        field.randomizeObstacles(); 
+        log("Map Randomized. Adaptive recalibration initiated.");
+    }}, 'randomize').name('Randomize Obstacles');
+    fEnv.add({ resetStats: () => { totalDelivered = 0; startTime = Date.now(); }}, 'resetStats').name('Reset Statistics');
+    fEnv.open();
+
+    window.addEventListener('resize', onWindowResize, false);
+    window.addEventListener('pkg-delivered', () => { totalDelivered++; });
+    animate();
+}
+
+function updateAGVCount(newCount) {
+    const agvGeo = new THREE.BoxGeometry(1.5, 2.5, 1.2);
+    
+    // 足りない分を追加
+    while (agvs.length < newCount) {
+        const a = new AGV(agvs.length);
+        const mat = new THREE.MeshBasicMaterial({ color: 0x00ffff });
+        a.mesh = new THREE.Mesh(agvGeo, mat);
+        scene.add(a.mesh);
+        agvs.push(a);
+    }
+    // 多い分を削除
+    while (agvs.length > newCount) {
+        const a = agvs.pop();
+        scene.remove(a.mesh);
+    }
+    
+    document.getElementById('agv-count-display').innerText = agvs.length;
+    log(`AGV Fleet resized to ${agvs.length} units.`);
+}
+
+function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function log(msg) {
+    const logEl = document.getElementById('log');
+    logEl.innerHTML = `> ${msg}<br>` + logEl.innerHTML;
+}
+
+function createDataTexture(data) {
+    const tex = new THREE.DataTexture(data, GRID_SIZE, GRID_SIZE, THREE.RedFormat, THREE.FloatType);
+    tex.needsUpdate = true;
+    return tex;
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    
+    // フィールド更新 (サブステップで挙動を安定化)
+    for(let i=0; i<2; i++) {
+        field.update();
+        agvs.forEach(a => a.update(field));
+    }
+
+    // AGVメッシュ更新
+    agvs.forEach(a => {
+        a.mesh.position.set(a.x, a.y, 1.5);
+        a.mesh.rotation.z = a.angle - Math.PI/2;
+        
+        // 状態に応じたカラーフィードバック
+        if (a.state === 'SEEK_PICKUP') a.mesh.material.color.set(0x00ffff);
+        else if (a.state === 'SEEK_DELIVERY') a.mesh.material.color.set(0xffff00);
+        else a.mesh.material.color.set(0xff00ff);
+        
+        // 荷物積載時は少し浮かせる
+        if (a.state.includes('DELIVERY')) a.mesh.position.z = 2.5;
+    });
+
+    // シェーダーユニフォーム更新
+    fieldMesh.material.uniforms.uPickup.value = createDataTexture(field.pickup);
+    fieldMesh.material.uniforms.uDelivery.value = createDataTexture(field.delivery);
+    fieldMesh.material.uniforms.uRepulsion.value = createDataTexture(field.repulsion);
+    fieldMesh.material.uniforms.uVein.value = createDataTexture(field.vein);
+    fieldMesh.material.uniforms.uObstacles.value = createDataTexture(new Float32Array(field.obstacles));
+
+    // UI統計
+    const elapsedMins = (Date.now() - startTime) / 60000;
+    if (elapsedMins > 0.01) {
+        document.getElementById('throughput').innerText = (totalDelivered / elapsedMins).toFixed(1);
+    }
+
+    renderer.render(scene, camera);
+}
+
+window.onload = init;
+</script>
+</body>
+</html>
